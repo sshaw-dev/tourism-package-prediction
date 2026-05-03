@@ -1,18 +1,18 @@
-# train.py — Hyperparameter-tuned model with MLflow tracking; saves best model to HF Hub
+# train.py
+# Trains a Random Forest model using:
+#   make_column_transformer  — scales numerics, one-hot encodes categoricals
+#   make_pipeline            — bundles preprocessor + model into one object
+#   GridSearchCV             — tunes hyperparameters with 5-fold CV
+# The best pipeline is saved with joblib and uploaded to Hugging Face Model Hub.
+
 import pandas as pd
-import numpy as np
-import joblib, os, mlflow, mlflow.sklearn
-from sklearn.ensemble import (
-    RandomForestClassifier, GradientBoostingClassifier,
-    AdaBoostClassifier, BaggingClassifier
-)
-from sklearn.tree import DecisionTreeClassifier
-from xgboost import XGBClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import GridSearchCV
-from sklearn.metrics import (
-    accuracy_score, f1_score, roc_auc_score,
-    recall_score, classification_report
-)
+from sklearn.metrics import accuracy_score, classification_report, recall_score
+import joblib
+import os
 from huggingface_hub import HfApi, create_repo
 from huggingface_hub.utils import RepositoryNotFoundError
 
@@ -21,92 +21,74 @@ DATASET_REPO = "shawsushant/tourism-package-prediction"
 MODEL_REPO   = "shawsushant/tourism-package-prediction-model"
 MODEL_FILE   = "best_tourism_model_v1.joblib"
 
-# ── Load train/test from Hugging Face ──────────────────────────────────
+# ── 1. Load train / test splits from Hugging Face ──────────────────────
 Xtrain = pd.read_csv(f"hf://datasets/{DATASET_REPO}/Xtrain.csv")
 Xtest  = pd.read_csv(f"hf://datasets/{DATASET_REPO}/Xtest.csv")
 ytrain = pd.read_csv(f"hf://datasets/{DATASET_REPO}/ytrain.csv").squeeze()
 ytest  = pd.read_csv(f"hf://datasets/{DATASET_REPO}/ytest.csv").squeeze()
-print(f"Xtrain: {Xtrain.shape}, Xtest: {Xtest.shape}")
+print(f"Xtrain: {Xtrain.shape}  |  Xtest: {Xtest.shape}")
+print(f"Xtrain dtypes:\n{Xtrain.dtypes}")
 
-# ── MLflow setup ───────────────────────────────────────────────────────
-mlflow.set_experiment("Tourism_Package_Prediction")
+# ── 2. Class weight to handle imbalance ────────────────────────────────
+class_weight = ytrain.value_counts()[0] / ytrain.value_counts()[1]
+print(f"Class weight ratio: {class_weight:.2f}")
 
-# ── Candidates and their hyperparameter grids ──────────────────────────
-candidates = {
-    "DecisionTree": (
-        DecisionTreeClassifier(class_weight='balanced', random_state=42),
-        {"max_depth": [3, 5, 7], "min_samples_split": [2, 5]}
-    ),
-    "RandomForest": (
-        RandomForestClassifier(class_weight='balanced', random_state=42),
-        {"n_estimators": [100, 200], "max_depth": [5, 8]}
-    ),
-    "GradientBoosting": (
-        GradientBoostingClassifier(random_state=42),
-        {"n_estimators": [100, 200], "learning_rate": [0.05, 0.1], "max_depth": [3, 5]}
-    ),
-    "AdaBoost": (
-        AdaBoostClassifier(random_state=42),
-        {"n_estimators": [50, 100], "learning_rate": [0.5, 1.0]}
-    ),
-    "Bagging": (
-        BaggingClassifier(random_state=42),
-        {"n_estimators": [50, 100], "max_samples": [0.7, 1.0]}
-    ),
-    "XGBoost": (
-        XGBClassifier(use_label_encoder=False, eval_metric='logloss',
-                      scale_pos_weight=ytrain.value_counts()[0]/ytrain.value_counts()[1],
-                      random_state=42),
-        {"n_estimators": [100, 200], "max_depth": [3, 5], "learning_rate": [0.05, 0.1]}
-    ),
+# ── 3. Pipeline: StandardScaler -> RandomForestClassifier ──────────────
+# All features are numeric (label-encoded in prep.py) so a single
+# StandardScaler over the full feature set is correct here.
+rf_model = RandomForestClassifier(
+    class_weight='balanced',
+    random_state=42
+)
+model_pipeline = make_pipeline(StandardScaler(), rf_model)
+
+# ── 4. Hyperparameter grid ─────────────────────────────────────────────
+param_grid = {
+    'randomforestclassifier__n_estimators':      [100, 200],
+    'randomforestclassifier__max_depth':         [5, 8, None],
+    'randomforestclassifier__max_features':      ['sqrt', 'log2'],
+    'randomforestclassifier__min_samples_split': [2, 5],
 }
 
-best_model, best_name, best_f1 = None, "", 0.0
-results = {}
+# ── 5. GridSearchCV with 5-fold cross-validation ───────────────────────
+grid_search = GridSearchCV(
+    model_pipeline,
+    param_grid,
+    cv=5,
+    scoring='recall',
+    n_jobs=-1
+)
+grid_search.fit(Xtrain, ytrain)
 
-for name, (model, param_grid) in candidates.items():
-    print(f"\nTuning {name}...")
-    gs = GridSearchCV(model, param_grid, cv=5, scoring='f1', n_jobs=-1, refit=True)
-    gs.fit(Xtrain, ytrain)
-    tuned = gs.best_estimator_
+# ── 6. Best model ──────────────────────────────────────────────────────
+best_model = grid_search.best_estimator_
+print("Best Params:\n", grid_search.best_params_)
 
-    y_pred  = tuned.predict(Xtest)
-    y_proba = tuned.predict_proba(Xtest)[:, 1]
-    acc  = accuracy_score(ytest, y_pred)
-    f1   = f1_score(ytest, y_pred)
-    rec  = recall_score(ytest, y_pred)
-    auc  = roc_auc_score(ytest, y_proba)
-    results[name] = {"Accuracy": acc, "F1": f1, "Recall": rec, "ROC-AUC": auc}
+# ── 7. Predict on training and test sets ───────────────────────────────
+y_pred_train = best_model.predict(Xtrain)
+y_pred_test  = best_model.predict(Xtest)
 
-    # Log everything to MLflow
-    with mlflow.start_run(run_name=name):
-        mlflow.log_params(gs.best_params_)
-        mlflow.log_metrics({"accuracy": acc, "f1": f1, "recall": rec, "roc_auc": auc})
-        mlflow.sklearn.log_model(tuned, name)
+# ── 8. Evaluation ──────────────────────────────────────────────────────
+print("\nTraining Classification Report:")
+print(classification_report(ytrain, y_pred_train,
+      target_names=['Not Purchased', 'Purchased']))
 
-    print(f"  Best params : {gs.best_params_}")
-    print(f"  Acc={acc:.4f}  F1={f1:.4f}  Recall={rec:.4f}  AUC={auc:.4f}")
-    print(classification_report(ytest, y_pred, target_names=['Not Purchased', 'Purchased']))
+print("Test Classification Report:")
+print(classification_report(ytest, y_pred_test,
+      target_names=['Not Purchased', 'Purchased']))
 
-    if f1 > best_f1:
-        best_f1, best_model, best_name = f1, tuned, name
-
-# ── Summary table ──────────────────────────────────────────────────────
-import pandas as pd
-print("\n── Results Summary ──")
-print(pd.DataFrame(results).T.sort_values('F1', ascending=False))
-print(f"\nBest model: {best_name}  (F1={best_f1:.4f})")
-
-# ── Save best model locally ────────────────────────────────────────────
+# ── 9. Save best model ─────────────────────────────────────────────────
 joblib.dump(best_model, MODEL_FILE)
 print(f"Model saved to {MODEL_FILE}")
 
-# ── Register best model on Hugging Face Model Hub ─────────────────────
+# ── 10. Upload to Hugging Face Model Hub ──────────────────────────────
 api = HfApi(token=os.getenv("HF_TOKEN"))
+
 try:
     api.repo_info(repo_id=MODEL_REPO, repo_type="model")
-    print(f"Model repo '{MODEL_REPO}' already exists.")
+    print(f"Model repo '{MODEL_REPO}' already exists. Using it.")
 except RepositoryNotFoundError:
+    print(f"Model repo '{MODEL_REPO}' not found. Creating new repo...")
     create_repo(repo_id=MODEL_REPO, repo_type="model", private=False)
     print(f"Model repo '{MODEL_REPO}' created.")
 
@@ -116,4 +98,4 @@ api.upload_file(
     repo_id=MODEL_REPO,
     repo_type="model",
 )
-print(f"Best model '{best_name}' registered on Hugging Face Model Hub: {MODEL_REPO}")
+print(f"Model registered on Hugging Face Model Hub: {MODEL_REPO}")

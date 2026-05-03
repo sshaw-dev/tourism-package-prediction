@@ -3,6 +3,7 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 from huggingface_hub import HfApi
+import pickle
 import os
 
 # ── Constants ──────────────────────────────────────────────────────────
@@ -21,9 +22,9 @@ df.drop(columns=drop_cols, inplace=True)
 print(f"Dropped columns: {drop_cols}")
 
 # ── 3. Impute missing values ────────────────────────────────────────────
-num_cols = df.select_dtypes(include=['float64', 'int64']).columns.tolist()
-cat_cols = df.select_dtypes(include=['object']).columns.tolist()
-target   = 'ProdTaken'
+num_cols  = df.select_dtypes(include=['float64', 'int64']).columns.tolist()
+cat_cols  = df.select_dtypes(include=['object']).columns.tolist()
+target    = 'ProdTaken'
 num_feats = [c for c in num_cols if c != target]
 
 for col in num_feats:
@@ -32,13 +33,17 @@ for col in cat_cols:
     df[col].fillna(df[col].mode()[0], inplace=True)
 print("Missing values imputed.")
 
-# ── 4. Encode categorical columns ──────────────────────────────────────
+# ── 4. Label-encode categorical columns and save encoders ──────────────
+# Encoders are saved so the Streamlit app can apply the same transformation
 encoders = {}
 for col in cat_cols:
     le = LabelEncoder()
     df[col] = le.fit_transform(df[col].astype(str))
     encoders[col] = le
-print("Categorical columns label-encoded.")
+
+with open("encoders.pkl", "wb") as f:
+    pickle.dump(encoders, f)
+print(f"Encoders saved for columns: {list(encoders.keys())}")
 
 # ── 5. Train-test split ─────────────────────────────────────────────────
 X = df.drop(columns=[target])
@@ -56,8 +61,8 @@ ytrain.to_csv("ytrain.csv", index=False)
 ytest.to_csv("ytest.csv",  index=False)
 print("Train/test CSVs saved locally.")
 
-# ── 7. Upload splits back to Hugging Face ──────────────────────────────
-for fname in ["Xtrain.csv", "Xtest.csv", "ytrain.csv", "ytest.csv"]:
+# ── 7. Upload splits + encoders back to Hugging Face ───────────────────
+for fname in ["Xtrain.csv", "Xtest.csv", "ytrain.csv", "ytest.csv", "encoders.pkl"]:
     api.upload_file(
         path_or_fileobj=fname,
         path_in_repo=fname,
